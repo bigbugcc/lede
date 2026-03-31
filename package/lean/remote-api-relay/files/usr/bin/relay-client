@@ -1,0 +1,109 @@
+#!/bin/sh
+# relay-client — WebSocket relay client for OpenWrt Remote API
+#
+# When mode=ssh, this script is NOT used (ssh binary handles it directly).
+# When mode=ws, this script maintains a WebSocket tunnel using socat/nc.
+#
+# The WebSocket relay protocol (simple):
+#  1. Router connects to wss://relay-server/relay/<device_id>
+#  2. Mobile app connects to https://relay-server/api/<device_id>/...
+#  3. Server forwards HTTP requests to router over the WebSocket connection
+#  4. Router proxies requests to local API (127.0.0.1:<local_port>)
+#
+# For production use, replace this with a compiled WebSocket client binary
+# (e.g. websocat, or a custom Go binary) for better performance.
+
+PROG=$(basename "$0")
+WS_URL=""
+TOKEN=""
+DEVICE_ID=""
+LOCAL_PORT="8443"
+
+_log() { logger -t relay-client "$@"; echo "$@" >&2; }
+_die() { _log "FATAL: $*"; exit 1; }
+
+usage() {
+	cat <<EOF
+Usage: $PROG [options]
+Options:
+  --mode ws              WebSocket relay mode (required)
+  --ws-url URL           WebSocket relay server URL (wss://...)
+  --token TOKEN          Authentication token for relay server
+  --device-id ID         Unique device identifier
+  --local-port PORT      Local API port to forward to (default: 8443)
+  -h, --help             Show this help
+EOF
+}
+
+# Parse arguments
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--mode)      MODE="$2";       shift 2 ;;
+		--ws-url)    WS_URL="$2";     shift 2 ;;
+		--token)     TOKEN="$2";      shift 2 ;;
+		--device-id) DEVICE_ID="$2";  shift 2 ;;
+		--local-port) LOCAL_PORT="$2"; shift 2 ;;
+		-h|--help)   usage; exit 0 ;;
+		*) _log "Unknown option: $1"; usage; exit 1 ;;
+	esac
+done
+
+[ "$MODE" != "ws" ] && _die "Only --mode ws is supported by this script"
+[ -z "$WS_URL" ]    && _die "--ws-url is required"
+[ -z "$DEVICE_ID" ] && _die "--device-id is required"
+
+# Build registration URL
+REG_URL="${WS_URL}register/${DEVICE_ID}"
+
+_log "Relay client starting: device=$DEVICE_ID, local_port=$LOCAL_PORT"
+_log "Relay URL: $REG_URL"
+
+# Main relay loop using socat (lightweight TCP proxy available on OpenWrt)
+# In production this should be replaced with a proper WebSocket client
+run_ws_relay() {
+	# Check if socat is available
+	if ! command -v socat >/dev/null 2>&1; then
+		_log "WARNING: socat not found. Install with: opkg install socat"
+		_log "Falling back to netcat-based relay (limited WebSocket support)"
+		run_nc_relay
+		return
+	fi
+
+	# Build the relay command
+	# socat connects to relay server and exposes local API
+	local relay_host relay_path
+	relay_host=$(echo "$WS_URL" | sed 's|wss://\([^/]*\).*|\1|')
+	relay_path=$(echo "$WS_URL" | sed 's|wss://[^/]*||')
+
+	_log "Connecting to relay server: $relay_host"
+
+	# The relay server connection string
+	# In production, replace this with a WebSocket-aware client
+	while true; do
+		socat \
+			"OPENSSL:${relay_host}:443,verify=0,commonname=${relay_host}" \
+			"TCP:127.0.0.1:${LOCAL_PORT}" \
+			2>/dev/null
+
+		local exit_code=$?
+		_log "Relay connection closed (exit=$exit_code), reconnecting in 10s..."
+		sleep 10
+	done
+}
+
+run_nc_relay() {
+	# Fallback: simple TCP forwarding using nc (no WebSocket)
+	local relay_host relay_port
+	relay_host=$(echo "$WS_URL" | sed 's|wss://\([^:]*\).*|\1|')
+	relay_port=$(echo "$WS_URL" | sed 's|wss://[^:]*:\([0-9]*\).*|\1|')
+	relay_port="${relay_port:-443}"
+
+	while true; do
+		_log "NC relay: connecting to $relay_host:$relay_port ..."
+		nc -w 30 "$relay_host" "$relay_port" 2>/dev/null
+		_log "Connection dropped, reconnecting in 10s..."
+		sleep 10
+	done
+}
+
+run_ws_relay

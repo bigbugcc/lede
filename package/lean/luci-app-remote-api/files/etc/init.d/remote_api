@@ -1,0 +1,138 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=95
+STOP=10
+
+PROG=/usr/sbin/uhttpd
+CONF_DIR=/var/run/remote-api
+CERT_DIR=/etc/remote-api
+
+EXTRA_COMMANDS="status genkey"
+EXTRA_HELP="	status  Show running status
+	genkey  Generate a new HTTPS certificate"
+
+_log() { logger -t remote-api "$@"; }
+
+_get_uci() { uci -q get "remote_api.main.$1"; }
+
+generate_cert() {
+	[ -d "$CERT_DIR" ] || mkdir -p "$CERT_DIR"
+	if [ ! -f "$CERT_DIR/server.crt" ] || [ ! -f "$CERT_DIR/server.key" ]; then
+		_log "Generating self-signed TLS certificate..."
+		openssl req -new -x509 \
+			-days 3650 \
+			-nodes \
+			-newkey ec \
+			-pkeyopt ec_paramgen_curve:P-256 \
+			-keyout "$CERT_DIR/server.key" \
+			-out "$CERT_DIR/server.crt" \
+			-subj "/CN=OpenWrt-RemoteAPI/O=OpenWrt" \
+			>/dev/null 2>&1 && \
+			chmod 600 "$CERT_DIR/server.key" && \
+			_log "Certificate generated: $CERT_DIR/server.crt"
+	fi
+}
+
+start_service() {
+	local enabled http_port https_port enable_https enable_http rate_limit cors_origin
+
+	enabled=$(_get_uci enabled)
+	[ "$enabled" = "0" ] && { _log "Remote API disabled"; return 0; }
+
+	http_port=$(_get_uci port)
+	https_port=$(_get_uci https_port)
+	enable_https=$(_get_uci enable_https)
+	enable_http=$(_get_uci enable_http)
+	cors_origin=$(_get_uci cors_origin)
+	http_port=${http_port:-8080}
+	https_port=${https_port:-8443}
+	enable_https=${enable_https:-1}
+	enable_http=${enable_http:-1}
+	cors_origin=${cors_origin:-*}
+
+	[ -d "$CONF_DIR" ] || mkdir -p "$CONF_DIR"
+
+	# Generate HTTPS certificate if needed
+	[ "$enable_https" = "1" ] && generate_cert
+
+	# Write rate-limit token bucket state dir
+	[ -d /var/run/remote-api-rl ] || mkdir -p /var/run/remote-api-rl
+
+	# Store CORS origin for api.uc to read
+	echo "$cors_origin" > "$CONF_DIR/cors_origin"
+	local rate_limit_val
+	rate_limit_val=$(_get_uci rate_limit)
+	echo "${rate_limit_val:-60}" > "$CONF_DIR/rate_limit"
+
+	procd_open_instance
+	procd_set_param command $PROG
+
+	[ "$enable_http" = "1" ] && {
+		procd_append_param command -p "0.0.0.0:$http_port"
+		procd_append_param command -p "[::]:$http_port"
+	}
+
+	[ "$enable_https" = "1" ] && {
+		procd_append_param command -s "0.0.0.0:$https_port"
+		procd_append_param command -s "[::]:$https_port"
+		procd_append_param command -C "$CERT_DIR/server.crt"
+		procd_append_param command -K "$CERT_DIR/server.key"
+	}
+
+	procd_append_param command \
+		-h /dev/null \
+		-x /cgi-bin \
+		-T 60 \
+		-k 20 \
+		-t 60 \
+		-A 1 \
+		-n 6 \
+		-N 100 \
+		-D \
+		-U ubus \
+		-u /var/run/ubus/ubus.sock \
+		-a \
+		-X /usr/lib/remote-api/api.uc
+
+	procd_set_param respawn
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param pidfile /var/run/remote-api-uhttpd.pid
+	procd_close_instance
+
+	_log "Remote API started (http_port=$http_port, https_port=$https_port)"
+}
+
+stop_service() {
+	_log "Remote API stopped"
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger "remote_api"
+}
+
+status() {
+	local pid
+	pid=$(cat /var/run/remote-api-uhttpd.pid 2>/dev/null)
+	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+		echo "Remote API is running (PID $pid)"
+		local port https_port
+		port=$(_get_uci port)
+		https_port=$(_get_uci https_port)
+		echo "  HTTP  port : ${port:-8080}"
+		echo "  HTTPS port : ${https_port:-8443}"
+	else
+		echo "Remote API is not running"
+	fi
+}
+
+genkey() {
+	rm -f "$CERT_DIR/server.crt" "$CERT_DIR/server.key"
+	generate_cert && echo "New certificate generated."
+}
