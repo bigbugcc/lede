@@ -1,0 +1,61 @@
+{
+  "remote-api": {
+    "description": "Grant remote API access to system and network information",
+    "read": {
+      "ubus": {
+        "system": [
+          "info",
+          "board"
+        ],
+        "network.interface": [
+          "dump",
+          "status"
+        ],
+        "network.device": [
+          "status"
+        ],
+        "iwinfo": [
+          "info",
+          "assoclist",
+          "scan",
+          "freqlist",
+          "txpowerlist"
+        ],
+        "session": [
+          "login",
+          "access",
+          "list"
+        ],
+        "service": [
+          "list"
+        ]
+      },
+      "uci": [
+        "get"
+      ]
+    },
+    "write": {
+      "ubus": {
+        "network": [
+          "reload"
+        ],
+        "network.interface.*": [
+          "up",
+          "down"
+        ],
+        "system": [
+          "reboot"
+        ],
+        "service": [
+          "list"
+        ]
+      },
+      "uci": [
+        "get",
+        "set",
+        "add",
+        "commit"
+      ]
+    }
+  }
+}

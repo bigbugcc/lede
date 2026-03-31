@@ -1,0 +1,26 @@
+config relay_client main
+	# Relay mode: 'ssh' (SSH reverse tunnel) or 'ws' (WebSocket relay)
+	option mode 'ssh'
+	option enabled '0'
+
+	# ─── SSH Reverse Tunnel Mode ───────────────────────────────────────────────
+	# Remote relay server SSH connection details
+	option ssh_host 'your-relay-server.example.com'
+	option ssh_port '22'
+	option ssh_user 'relay'
+	# Path to SSH private key (generate with: ssh-keygen -t ed25519 -f /etc/relay_id_ed25519)
+	option ssh_key '/etc/relay_id_ed25519'
+	# Remote port on the relay server that will forward to local API
+	option remote_port '18443'
+	# Local API port to expose (should match luci-app-remote-api https_port)
+	option local_port '8443'
+	# Keepalive interval in seconds
+	option keepalive '30'
+
+	# ─── WebSocket Relay Mode ──────────────────────────────────────────────────
+	# WebSocket relay server URL (wss:// for TLS)
+	option ws_url 'wss://your-relay-server.example.com/relay/'
+	# Shared secret/token for authenticating with the relay server
+	option ws_token ''
+	# Device ID to register with the relay server (default: router MAC address)
+	option device_id ''

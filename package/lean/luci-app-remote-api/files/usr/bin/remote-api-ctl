@@ -1,0 +1,164 @@
+#!/bin/sh
+# remote-api-ctl — Control tool for the OpenWrt Remote API service
+# Usage: remote-api-ctl <command> [args]
+#
+# Commands:
+#   generate-secret   Generate a new HMAC secret key (invalidates all existing tokens)
+#   show-secret       Print the current secret key
+#   generate-token    Generate a new API token for a given user
+#   verify-token      Verify an API token
+#   list-tokens       List active (non-expired) token records
+#   revoke-all        Revoke all active tokens (rotate secret)
+#   status            Show service status
+
+SECRET_FILE=/etc/remote-api.secret
+REVOKED_FILE=/var/run/remote-api/revoked_tokens
+CONFIG_SECTION=remote_api.main
+
+_die() { echo "ERROR: $*" >&2; exit 1; }
+_info() { echo "INFO: $*"; }
+
+_uci_get() { uci -q get "${CONFIG_SECTION}.$1"; }
+
+_hmac_sha256() {
+	local key="$1"
+	local data="$2"
+	printf '%s' "$data" | openssl dgst -sha256 -hmac "$key" -hex 2>/dev/null | awk '{print $NF}'
+}
+
+_base64url_encode() {
+	# Encode using base64 and make URL-safe
+	printf '%s' "$1" | base64 | tr '+/' '-_' | tr -d '='
+}
+
+cmd_generate_secret() {
+	local new_secret
+	new_secret=$(openssl rand -hex 32) || _die "openssl not available"
+	echo "$new_secret" > "$SECRET_FILE"
+	chmod 600 "$SECRET_FILE"
+	_info "New API secret generated: $SECRET_FILE"
+	_info "All existing tokens have been invalidated."
+}
+
+cmd_show_secret() {
+	[ -f "$SECRET_FILE" ] || _die "Secret file not found. Run: remote-api-ctl generate-secret"
+	cat "$SECRET_FILE"
+}
+
+cmd_generate_token() {
+	local username="${1:-root}"
+	local expire_days
+
+	[ -f "$SECRET_FILE" ] || _die "No secret found. Run: remote-api-ctl generate-secret"
+	local secret
+	secret=$(cat "$SECRET_FILE")
+
+	expire_days=$(_uci_get token_expire)
+	expire_days=$(( ${expire_days:-2592000} / 86400 ))
+
+	local now
+	now=$(date +%s)
+	local expire_at=$(( now + expire_days * 86400 ))
+
+	local payload="${now}.${username}.${expire_at}"
+	local sig
+	sig=$(_hmac_sha256 "$secret" "$payload")
+
+	[ -z "$sig" ] && _die "Failed to generate HMAC signature (openssl required)"
+
+	local token="${payload}.${sig}"
+	echo "$token"
+}
+
+cmd_verify_token() {
+	local token="$1"
+	[ -z "$token" ] && _die "Usage: remote-api-ctl verify-token <token>"
+	[ -f "$SECRET_FILE" ] || _die "No secret file"
+
+	local secret
+	secret=$(cat "$SECRET_FILE")
+
+	# Token format: <timestamp>.<username>.<expire_at>.<signature>
+	local ts username expire_at sig
+	ts=$(echo "$token" | cut -d. -f1)
+	username=$(echo "$token" | cut -d. -f2)
+	expire_at=$(echo "$token" | cut -d. -f3)
+	sig=$(echo "$token" | cut -d. -f4)
+
+	[ -z "$ts" ] || [ -z "$username" ] || [ -z "$expire_at" ] || [ -z "$sig" ] && {
+		echo "INVALID: malformed token"
+		return 1
+	}
+
+	local now
+	now=$(date +%s)
+	if [ "$expire_at" -lt "$now" ]; then
+		echo "INVALID: token expired at $(date -d @$expire_at 2>/dev/null || date -r $expire_at)"
+		return 1
+	fi
+
+	local payload="${ts}.${username}.${expire_at}"
+	local expected_sig
+	expected_sig=$(_hmac_sha256 "$secret" "$payload")
+
+	if [ "$sig" = "$expected_sig" ]; then
+		echo "VALID: user=$username, expires=$(date -d @$expire_at 2>/dev/null || echo $expire_at)"
+		return 0
+	else
+		echo "INVALID: signature mismatch"
+		return 1
+	fi
+}
+
+cmd_revoke_all() {
+	cmd_generate_secret
+	_info "All tokens revoked (new secret generated)."
+}
+
+cmd_status() {
+	local pid
+	pid=$(cat /var/run/remote-api-uhttpd.pid 2>/dev/null)
+	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+		echo "Status:    RUNNING (PID $pid)"
+	else
+		echo "Status:    STOPPED"
+	fi
+
+	local http_port https_port enabled
+	enabled=$(_uci_get enabled)
+	http_port=$(_uci_get port)
+	https_port=$(_uci_get https_port)
+	echo "Enabled:   ${enabled:-1}"
+	echo "HTTP port: ${http_port:-8080}"
+	echo "HTTPS port:${https_port:-8443}"
+
+	if [ -f "$SECRET_FILE" ]; then
+		echo "Secret:    present ($SECRET_FILE)"
+	else
+		echo "Secret:    NOT CONFIGURED (run: remote-api-ctl generate-secret)"
+	fi
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+case "$1" in
+	generate-secret)  cmd_generate_secret ;;
+	show-secret)      cmd_show_secret ;;
+	generate-token)   cmd_generate_token "$2" ;;
+	verify-token)     cmd_verify_token "$2" ;;
+	revoke-all)       cmd_revoke_all ;;
+	status)           cmd_status ;;
+	*)
+		cat <<EOF
+Usage: remote-api-ctl <command> [args]
+
+Commands:
+  generate-secret          Generate new HMAC secret (invalidates all tokens)
+  show-secret              Print current secret
+  generate-token [user]    Generate API token for user (default: root)
+  verify-token <token>     Verify an API token
+  revoke-all               Revoke all tokens by rotating secret
+  status                   Show service status
+EOF
+		exit 1
+		;;
+esac

@@ -1,0 +1,10 @@
+config remote_api main
+	option enabled '1'
+	option port '8080'
+	option https_port '8443'
+	option enable_https '1'
+	option enable_http '1'
+	option token_expire '2592000'
+	option rate_limit '60'
+	option log_access '1'
+	option cors_origin '*'

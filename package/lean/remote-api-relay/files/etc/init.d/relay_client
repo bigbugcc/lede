@@ -1,0 +1,171 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=96
+STOP=10
+
+EXTRA_COMMANDS="status genkey"
+EXTRA_HELP="	status  Show relay connection status
+	genkey  Generate SSH key pair for relay authentication"
+
+_log() { logger -t relay-client "$@"; }
+
+_get_uci() { uci -q get "relay_client.main.$1"; }
+
+generate_ssh_key() {
+	local key_file
+	key_file=$(_get_uci ssh_key)
+	key_file="${key_file:-/etc/relay_id_ed25519}"
+
+	if [ ! -f "$key_file" ]; then
+		_log "Generating SSH key pair: $key_file"
+		# The key is generated without a passphrase (-N '') because it is used
+		# by an unattended daemon.  Security relies entirely on file-system
+		# permissions (chmod 600) and keeping the key file on the device.
+		# Do NOT copy the private key off the device.
+		ssh-keygen -t ed25519 -N '' -f "$key_file" >/dev/null 2>&1
+		chmod 600 "$key_file"
+		_log "Public key (add to relay server authorized_keys):"
+		cat "${key_file}.pub"
+	else
+		_log "SSH key already exists: $key_file"
+		cat "${key_file}.pub"
+	fi
+}
+
+start_ssh_relay() {
+	local ssh_host ssh_port ssh_user ssh_key remote_port local_port keepalive
+
+	ssh_host=$(_get_uci ssh_host)
+	ssh_port=$(_get_uci ssh_port)
+	ssh_user=$(_get_uci ssh_user)
+	ssh_key=$(_get_uci ssh_key)
+	remote_port=$(_get_uci remote_port)
+	local_port=$(_get_uci local_port)
+	keepalive=$(_get_uci keepalive)
+
+	ssh_port="${ssh_port:-22}"
+	ssh_user="${ssh_user:-relay}"
+	ssh_key="${ssh_key:-/etc/relay_id_ed25519}"
+	remote_port="${remote_port:-18443}"
+	local_port="${local_port:-8443}"
+	keepalive="${keepalive:-30}"
+
+	if [ -z "$ssh_host" ]; then
+		_log "ERROR: ssh_host not configured in /etc/config/relay_client"
+		return 1
+	fi
+
+	if [ ! -f "$ssh_key" ]; then
+		_log "ERROR: SSH key not found: $ssh_key. Run: /etc/init.d/relay_client genkey"
+		return 1
+	fi
+
+	_log "Starting SSH reverse tunnel: $ssh_user@$ssh_host:$ssh_port -> remote:$remote_port -> local:$local_port"
+
+	procd_open_instance
+	procd_set_param command ssh \
+		-N \
+		-T \
+		-o "StrictHostKeyChecking=accept-new" \
+		-o "ServerAliveInterval=$keepalive" \
+		-o "ServerAliveCountMax=3" \
+		-o "ExitOnForwardFailure=yes" \
+		-o "BatchMode=yes" \
+		-i "$ssh_key" \
+		-p "$ssh_port" \
+		-R "0.0.0.0:${remote_port}:127.0.0.1:${local_port}" \
+		"${ssh_user}@${ssh_host}" \
+		"echo relay-ok; sleep infinity"
+	procd_set_param respawn 10 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+start_ws_relay() {
+	local ws_url ws_token device_id local_port
+
+	ws_url=$(_get_uci ws_url)
+	ws_token=$(_get_uci ws_token)
+	device_id=$(_get_uci device_id)
+	local_port=$(_get_uci local_port)
+	local_port="${local_port:-8443}"
+
+	if [ -z "$ws_url" ]; then
+		_log "ERROR: ws_url not configured"
+		return 1
+	fi
+
+	# Auto-generate device_id from LAN MAC if not set
+	if [ -z "$device_id" ]; then
+		device_id=$(cat /sys/class/net/br-lan/address 2>/dev/null | tr -d ':')
+		device_id="${device_id:-$(cat /sys/class/net/eth0/address 2>/dev/null | tr -d ':')}"
+	fi
+
+	_log "Starting WebSocket relay: device=$device_id -> $ws_url"
+
+	procd_open_instance
+	procd_set_param command /usr/bin/relay-client \
+		--mode ws \
+		--ws-url "$ws_url" \
+		--token "$ws_token" \
+		--device-id "$device_id" \
+		--local-port "$local_port"
+	procd_set_param respawn 10 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+start_service() {
+	local enabled mode
+
+	enabled=$(_get_uci enabled)
+	[ "$enabled" = "0" ] && { _log "Relay client disabled"; return 0; }
+
+	mode=$(_get_uci mode)
+	mode="${mode:-ssh}"
+
+	case "$mode" in
+		ssh) start_ssh_relay ;;
+		ws)  start_ws_relay  ;;
+		*)   _log "Unknown relay mode: $mode (use 'ssh' or 'ws')"; return 1 ;;
+	esac
+}
+
+stop_service() {
+	_log "Relay client stopped"
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger "relay_client"
+}
+
+status() {
+	local mode pid_file pid
+	mode=$(_get_uci mode)
+	mode="${mode:-ssh}"
+	echo "Relay mode: $mode"
+
+	if procd_running relay_client; then
+		echo "Status:    RUNNING"
+	else
+		echo "Status:    STOPPED"
+	fi
+
+	local ssh_host remote_port
+	ssh_host=$(_get_uci ssh_host)
+	remote_port=$(_get_uci remote_port)
+	[ -n "$ssh_host" ] && echo "SSH Host:  $ssh_host"
+	[ -n "$remote_port" ] && echo "Remote Port: $remote_port"
+}
+
+genkey() {
+	generate_ssh_key
+}
